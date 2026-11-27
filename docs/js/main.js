@@ -1,4 +1,4 @@
-import { detectCard, warp, rotate180, cropCard, whitening, centering, sharpness, forOcr, makeImage } from "./vision.js";
+import { detectCard, detectInFrame, crop, warp, rotate180, cropCard, whitening, centering, sharpness, forOcr, makeImage } from "./vision.js";
 import { parseSetCode, languageOf, lookupFuzzy, cardmarketLinks } from "./cards.js";
 import { grade, QUESTIONS } from "./grade.js";
 import * as db from "./store.js";
@@ -73,37 +73,93 @@ function capture(side, job) {
   document.getElementById("home").hidden = false;
   document.getElementById("title").textContent = name;
   app.innerHTML = `
-    <div class="box">
+    <div class="box" id="pick">
       <h2>${side === "front" ? "1" : "2"}. ${name} fotografieren</h2>
-      <p class="sub">${side === "back" ? "Die Rückseite ist wichtig: Weiße Stellen an den braunen Kanten zeigen, wie viel die Karte gespielt wurde." : "Achte darauf, dass der Set-Code unter dem Bild scharf ist."}</p>
-      <label class="btn wide"><input type="file" accept="image/*" capture="environment" hidden id="file">Kamera öffnen</label>
+      <p class="sub">${side === "back" ? "Die Rückseite ist wichtig: Weiße Stellen an den braunen Kanten zeigen, wie viel die Karte gespielt wurde." : "Lege die Karte so in den Rahmen, dass der Set-Code unter dem Bild scharf ist."}</p>
+      <button class="wide" id="cam">Kamera mit Rahmen öffnen</button>
       <label class="btn sec wide"><input type="file" accept="image/*" hidden id="file2">Foto aus der Galerie</label>
     </div>
     <div class="box" id="adjust" hidden>
       <p class="sub" id="detmsg"></p>
       <div class="stage" id="stage"><canvas id="cv"></canvas></div>
       <button class="wide" id="ok">Passt, weiter</button>
+      <button class="sec wide" id="again">Neu aufnehmen</button>
     </div>`;
-  const onFile = async e => {
+  const next = (img, quad, found) => {
+    app.querySelector("#pick").hidden = true;
+    app.querySelector("#adjust").hidden = false;
+    app.querySelector("#detmsg").innerHTML = found
+      ? "Karte erkannt. Liegt ein blauer Punkt nicht genau auf einer Kartenecke, zieh ihn mit dem Finger hin."
+      : `<span class="warn">Den Kartenrand konnte ich nicht sicher finden.</span> Zieh die vier blauen Punkte genau auf die Kartenecken.`;
+    editor(img, quad, q => { job[side] = { img, quad: q }; side === "front" ? capture("back", job) : analyze(job); });
+    app.querySelector("#again").onclick = () => capture(side, job);
+  };
+  app.querySelector("#cam").onclick = () => camera(name).then(r => {
+    if (!r) return;
+    // keep only the area around the frame: easier to check, less to compute
+    const [x0, y0, x1, y1] = r.rect, mx = (x1 - x0) * 0.12, my = (y1 - y0) * 0.08;
+    const cx = Math.max(0, x0 - mx), cy = Math.max(0, y0 - my);
+    const img = crop(r.img, cx, cy, x1 + mx, y1 + my);
+    const res = detectInFrame(img, [x0 - cx, y0 - cy, x1 - cx, y1 - cy]);
+    next(img, res.quad, res.found);
+  }).catch(e => {
+    app.querySelector("#pick").insertAdjacentHTML("beforeend", `<p class="err">Kamera nicht verfügbar (${esc(e.message || e)}). Erlaube den Kamerazugriff oder nimm ein Foto aus der Galerie.</p>`);
+  });
+  app.querySelector("#file2").onchange = async e => {
     const f = e.target.files[0];
     if (!f) return;
-    app.querySelector("#adjust").hidden = false;
-    app.querySelector("#adjust").scrollIntoView({ behavior: "smooth" });
-    app.querySelector("#detmsg").innerHTML = `<span class="progress"><span class="spinner"></span>Suche die Karte im Foto…</span>`;
     const img = await fileToImage(f);
-    await new Promise(r => setTimeout(r, 20));
     let quad = detectCard(img);
-    app.querySelector("#detmsg").innerHTML = quad
-      ? "Die Ecken der Karte sind markiert. Stimmt etwas nicht, zieh die blauen Punkte genau auf die Kartenecken."
-      : `<span class="warn">Karte nicht automatisch gefunden.</span> Zieh die vier blauen Punkte auf die Kartenecken. Ein dunkler Untergrund hilft.`;
-    if (!quad) {
-      const w = img.width, h = img.height;
-      quad = [[w * .25, h * .2], [w * .75, h * .2], [w * .75, h * .8], [w * .25, h * .8]];
-    }
-    editor(img, quad, q => { job[side] = { img, quad: q }; side === "front" ? capture("back", job) : analyze(job); });
+    const found = !!quad;
+    if (!quad) { const w = img.width, h = img.height; quad = [[w * .25, h * .2], [w * .75, h * .2], [w * .75, h * .8], [w * .25, h * .8]]; }
+    next(img, quad, found);
   };
-  app.querySelector("#file").onchange = onFile;
-  app.querySelector("#file2").onchange = onFile;
+}
+
+// Full-screen live camera with a card-shaped frame. Resolves {img, rect}
+// (photo + frame position in photo pixels) or null when cancelled.
+async function camera(name) {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } },
+  });
+  const ov = document.createElement("div");
+  ov.className = "cam";
+  ov.innerHTML = `<video playsinline muted autoplay></video><div class="frame"><i></i><i></i><i></i><i></i></div>
+    <p class="hint">${esc(name)}: Karte genau in den Rahmen legen, dunkler Untergrund, kein Spiegeln</p>
+    <div class="bar"><button class="sec" data-a="x">Abbrechen</button><button class="shutter" data-a="shot" aria-label="Foto aufnehmen"></button><span></span></div>`;
+  document.body.appendChild(ov);
+  const video = ov.querySelector("video"), frame = ov.querySelector(".frame");
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  const layout = () => {
+    // card-shaped frame, as big as fits with room for the buttons
+    const W = ov.clientWidth, H = ov.clientHeight - 150;
+    let fh = H * 0.86, fw = fh * 59 / 86;
+    if (fw > W * 0.86) { fw = W * 0.86; fh = fw * 86 / 59; }
+    Object.assign(frame.style, { width: fw + "px", height: fh + "px", left: (W - fw) / 2 + "px", top: 60 + (H - 60 - fh) / 2 + "px" });
+  };
+  layout();
+  addEventListener("resize", layout);
+  const result = await new Promise(res => {
+    ov.onclick = e => {
+      const a = e.target.dataset.a;
+      if (a === "x") res(null);
+      if (a !== "shot" || !video.videoWidth) return;
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const c = document.createElement("canvas"); c.width = vw; c.height = vh;
+      c.getContext("2d").drawImage(video, 0, 0);
+      // video is shown with object-fit: cover; map the frame back to video pixels
+      const r = video.getBoundingClientRect(), f = frame.getBoundingClientRect();
+      const s = Math.max(r.width / vw, r.height / vh), ox = (r.width - vw * s) / 2, oy = (r.height - vh * s) / 2;
+      const toV = (x, y) => [(x - r.left - ox) / s, (y - r.top - oy) / s];
+      const [x0, y0] = toV(f.left, f.top), [x1, y1] = toV(f.right, f.bottom);
+      res({ img: c.getContext("2d").getImageData(0, 0, vw, vh), rect: [x0, y0, x1, y1] });
+    };
+  });
+  removeEventListener("resize", layout);
+  stream.getTracks().forEach(t => t.stop());
+  ov.remove();
+  return result;
 }
 
 function editor(img, quad, done) {

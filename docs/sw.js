@@ -1,5 +1,5 @@
 // Offline support: keep the app and the text recognition files on the phone.
-const VERSION = "kartenwert-v1";
+const VERSION = "kartenwert-v2";
 const FILES = [
   "./", "index.html", "manifest.webmanifest", "js/main.js", "js/vision.js", "js/cards.js", "js/grade.js", "js/store.js",
   "icons/icon-192.png", "icons/icon-512.png",

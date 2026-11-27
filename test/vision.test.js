@@ -44,3 +44,17 @@ test("centring left/right", () => {
   const c2 = centering(warp(off, detectCard(off)));
   assert.ok(c2.offset >= 10 && c2.left > c2.right, JSON.stringify(c2));
 });
+
+test("card inside the on-screen frame", async () => {
+  const { detectInFrame } = await import("../docs/js/vision.js");
+  const { img, quad } = photo({ paint: back(), angle: 0.04 });
+  // frame drawn a little bigger than the card, as on the phone
+  const r = detectInFrame(img, [180, 190, 720, 1010]);
+  assert.ok(r.found);
+  close(r.quad, quad, 6);
+  // nothing there: falls back to the frame
+  const empty = photo({ paint: back(), cx: 2000 }).img;
+  const r2 = detectInFrame(empty, [180, 190, 720, 1010]);
+  assert.equal(r2.found, false);
+  assert.deepEqual(r2.quad[0], [180, 190]);
+});

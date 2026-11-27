@@ -279,3 +279,32 @@ export function forOcr(img, scale = 3) {
   }
   return out;
 }
+
+export function crop(img, x0, y0, x1, y1) {
+  x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0));
+  x1 = Math.min(img.width, Math.round(x1)); y1 = Math.min(img.height, Math.round(y1));
+  const w = x1 - x0, h = y1 - y0, out = makeImage(w, h);
+  for (let y = 0; y < h; y++) out.data.set(img.data.subarray(((y0 + y) * img.width + x0) * 4, ((y0 + y) * img.width + x1) * 4), y * w * 4);
+  return out;
+}
+
+// The user placed the card inside a frame on screen. rect = [x0, y0, x1, y1]
+// of that frame in image pixels. Looks for the exact outline near the frame
+// and falls back to the frame itself if the result is implausible.
+// Returns {quad, found}.
+export function detectInFrame(img, rect) {
+  const [x0, y0, x1, y1] = rect, fw = x1 - x0, fh = y1 - y0;
+  const frameQuad = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  const px = fw * 0.15, py = fh * 0.15;
+  const cx0 = Math.max(0, x0 - px), cy0 = Math.max(0, y0 - py);
+  const part = crop(img, cx0, cy0, x1 + px, y1 + py);
+  const q = detectCard(part);
+  if (!q) return { quad: frameQuad, found: false };
+  const quad = q.map(([x, y]) => [x + cx0, y + cy0]);
+  const area = p => Math.abs(p.reduce((s, a, i) => { const b = p[(i + 1) % 4]; return s + a[0] * b[1] - b[0] * a[1]; }, 0)) / 2;
+  const ratio = area(quad) / (fw * fh);
+  const h = (dist(quad[0], quad[3]) + dist(quad[1], quad[2])) / 2, w = (dist(quad[0], quad[1]) + dist(quad[3], quad[2])) / 2;
+  const shapeOk = Math.abs(h / w - CARD_RATIO) / CARD_RATIO < 0.18;
+  const near = quad.every((p, i) => dist(p, frameQuad[i]) < 0.25 * Math.hypot(fw, fh));
+  return ratio > 0.55 && ratio < 1.45 && shapeOk && near ? { quad, found: true } : { quad: frameQuad, found: false };
+}
