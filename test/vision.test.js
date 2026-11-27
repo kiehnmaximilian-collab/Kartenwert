@@ -58,3 +58,10 @@ test("card inside the on-screen frame", async () => {
   assert.equal(r2.found, false);
   assert.deepEqual(r2.quad[0], [180, 190]);
 });
+
+test("card bigger than the frame is still found", async () => {
+  const { detectInFrame } = await import("../docs/js/vision.js");
+  const { img, quad } = photo({ paint: back(), angle: 0.03 });
+  const r = detectInFrame(img, [260, 330, 640, 880]);   // frame much smaller than the card
+  assert.ok(r.found); close(r.quad, quad, 6);
+});

@@ -1,4 +1,4 @@
-import { detectCard, detectInFrame, crop, warp, rotate180, cropCard, whitening, centering, sharpness, forOcr, makeImage } from "./vision.js";
+import { detectCard, detectInFrame, refine, crop, warp, rotate180, cropCard, whitening, centering, sharpness, forOcr, makeImage } from "./vision.js";
 import { parseSetCode, languageOf, lookupFuzzy, cardmarketLinks } from "./cards.js";
 import { grade, QUESTIONS } from "./grade.js";
 import * as db from "./store.js";
@@ -9,6 +9,7 @@ const eur = v => (v == null || v === "" || isNaN(v)) ? "–" : Number(v).toLocal
 const COND = { MT: "Mint", NM: "Near Mint", EX: "Excellent", GD: "Good", LP: "Light Played", PL: "Played", PO: "Poor" };
 const LANGS = { DE: "Deutsch", EN: "Englisch", FR: "Französisch", IT: "Italienisch", ES: "Spanisch", PT: "Portugiesisch", JP: "Japanisch", KO: "Koreanisch" };
 const WARP_W = 1000;
+const SHARP_MIN = 15;   // variance of the Laplacian below this = blurry
 
 document.getElementById("home").onclick = () => home();
 
@@ -85,23 +86,24 @@ function capture(side, job) {
       <button class="wide" id="ok">Passt, weiter</button>
       <button class="sec wide" id="again">Neu aufnehmen</button>
     </div>`;
-  const next = (img, quad, found) => {
+  const next = (img, quad, found, sharp = Infinity) => {
     app.querySelector("#pick").hidden = true;
     app.querySelector("#adjust").hidden = false;
-    app.querySelector("#detmsg").innerHTML = found
+    app.querySelector("#detmsg").innerHTML = (sharp < SHARP_MIN
+      ? `<b class="warn">Das Foto ist unscharf.</b> Tippe besser auf „Neu aufnehmen“: Handy etwas weiter weg, vor dem Auslösen auf die Karte tippen, mehr Licht.<br>` : "") + (found
       ? "Karte erkannt. Liegt ein blauer Punkt nicht genau auf einer Kartenecke, zieh ihn mit dem Finger hin."
-      : `<span class="warn">Den Kartenrand konnte ich nicht sicher finden.</span> Zieh die vier blauen Punkte genau auf die Kartenecken.`;
+      : `<span class="warn">Den Kartenrand konnte ich nicht sicher finden.</span> Zieh die vier blauen Punkte genau auf die Kartenecken.`);
     editor(img, quad, q => { job[side] = { img, quad: q }; side === "front" ? capture("back", job) : analyze(job); });
     app.querySelector("#again").onclick = () => capture(side, job);
   };
   app.querySelector("#cam").onclick = () => camera(name).then(r => {
     if (!r) return;
     // keep only the area around the frame: easier to check, less to compute
-    const [x0, y0, x1, y1] = r.rect, mx = (x1 - x0) * 0.12, my = (y1 - y0) * 0.08;
+    const [x0, y0, x1, y1] = r.rect, mx = (x1 - x0) * 0.35, my = (y1 - y0) * 0.25;
     const cx = Math.max(0, x0 - mx), cy = Math.max(0, y0 - my);
     const img = crop(r.img, cx, cy, x1 + mx, y1 + my);
     const res = detectInFrame(img, [x0 - cx, y0 - cy, x1 - cx, y1 - cy]);
-    next(img, res.quad, res.found);
+    next(img, res.quad, res.found, sharpness(warp(img, res.quad, 500)));
   }).catch(e => {
     app.querySelector("#pick").insertAdjacentHTML("beforeend", `<p class="err">Kamera nicht verfügbar (${esc(e.message || e)}). Erlaube den Kamerazugriff oder nimm ein Foto aus der Galerie.</p>`);
   });
@@ -110,6 +112,7 @@ function capture(side, job) {
     if (!f) return;
     const img = await fileToImage(f);
     let quad = detectCard(img);
+    if (quad) quad = refine(img, quad);
     const found = !!quad;
     if (!quad) { const w = img.width, h = img.height; quad = [[w * .25, h * .2], [w * .75, h * .2], [w * .75, h * .8], [w * .25, h * .8]]; }
     next(img, quad, found);
@@ -122,37 +125,73 @@ async function camera(name) {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 3840 }, height: { ideal: 2160 } },
   });
+  const track = stream.getVideoTracks()[0];
+  const caps = (track.getCapabilities && track.getCapabilities()) || {};
+  const apply = c => track.applyConstraints({ advanced: [c] }).catch(() => {});
+  if ((caps.focusMode || []).includes("continuous")) apply({ focusMode: "continuous" });
   const ov = document.createElement("div");
   ov.className = "cam";
   ov.innerHTML = `<video playsinline muted autoplay></video><div class="frame"><i></i><i></i><i></i><i></i></div>
-    <p class="hint">${esc(name)}: Karte genau in den Rahmen legen, dunkler Untergrund, kein Spiegeln</p>
-    <div class="bar"><button class="sec" data-a="x">Abbrechen</button><button class="shutter" data-a="shot" aria-label="Foto aufnehmen"></button><span></span></div>`;
+    <p class="hint">${esc(name)}: Karte in den Rahmen, Handy ca. 20 cm über der Karte. Tippe auf die Karte zum Scharfstellen.</p>
+    <div class="bar"><button class="sec" data-a="x">Abbrechen</button><button class="shutter" data-a="shot" aria-label="Foto aufnehmen"></button>
+      ${caps.torch ? `<button class="sec" data-a="torch">Licht</button>` : "<span></span>"}</div>`;
   document.body.appendChild(ov);
   const video = ov.querySelector("video"), frame = ov.querySelector(".frame");
   video.srcObject = stream;
   await video.play().catch(() => {});
   const layout = () => {
-    // card-shaped frame, as big as fits with room for the buttons
+    // Not too big: a phone held very close to the card can't focus.
     const W = ov.clientWidth, H = ov.clientHeight - 150;
-    let fh = H * 0.86, fw = fh * 59 / 86;
-    if (fw > W * 0.86) { fw = W * 0.86; fh = fw * 86 / 59; }
+    let fh = H * 0.62, fw = fh * 59 / 86;
+    if (fw > W * 0.62) { fw = W * 0.62; fh = fw * 86 / 59; }
     Object.assign(frame.style, { width: fw + "px", height: fh + "px", left: (W - fw) / 2 + "px", top: 60 + (H - 60 - fh) / 2 + "px" });
   };
   layout();
   addEventListener("resize", layout);
+  let torch = false, busy = false;
   const result = await new Promise(res => {
-    ov.onclick = e => {
+    ov.onclick = async e => {
       const a = e.target.dataset.a;
-      if (a === "x") res(null);
-      if (a !== "shot" || !video.videoWidth) return;
+      if (a === "x") return res(null);
+      if (a === "torch") { torch = !torch; return apply({ torch }); }
+      if (a !== "shot") {
+        // tap to focus where the user tapped
+        const r = video.getBoundingClientRect();
+        if ((caps.focusMode || []).includes("single-shot")) {
+          await apply({ pointsOfInterest: [{ x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }], focusMode: "single-shot" });
+          setTimeout(() => (caps.focusMode || []).includes("continuous") && apply({ focusMode: "continuous" }), 1500);
+        }
+        return;
+      }
+      if (busy || !video.videoWidth) return;
+      busy = true;
+      ov.querySelector(".shutter").style.opacity = ".4";
       const vw = video.videoWidth, vh = video.videoHeight;
-      const c = document.createElement("canvas"); c.width = vw; c.height = vh;
-      c.getContext("2d").drawImage(video, 0, 0);
-      // video is shown with object-fit: cover; map the frame back to video pixels
+      // frame position as a share of the video picture (shown with object-fit: cover)
       const r = video.getBoundingClientRect(), f = frame.getBoundingClientRect();
       const s = Math.max(r.width / vw, r.height / vh), ox = (r.width - vw * s) / 2, oy = (r.height - vh * s) / 2;
       const toV = (x, y) => [(x - r.left - ox) / s, (y - r.top - oy) / s];
       const [x0, y0] = toV(f.left, f.top), [x1, y1] = toV(f.right, f.bottom);
+      // Full-resolution photo with the camera's own focus, where the browser offers it.
+      try {
+        if (window.ImageCapture) {
+          const blob = await new ImageCapture(track).takePhoto();
+          const bmp = await createImageBitmap(blob, { imageOrientation: "from-image" });
+          const pw = bmp.width, ph = bmp.height;
+          if ((pw > ph) === (vw > vh)) {
+            // the preview is usually a centred cut-out of the photo
+            const k = Math.min(pw / vw, ph / vh), dx = (pw - vw * k) / 2, dy = (ph - vh * k) / 2;
+            const sc = Math.min(1, 4000 / Math.max(pw, ph));
+            const c = document.createElement("canvas"); c.width = Math.round(pw * sc); c.height = Math.round(ph * sc);
+            c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+            const m = v => v * sc;
+            return res({ img: c.getContext("2d").getImageData(0, 0, c.width, c.height),
+                         rect: [m(x0 * k + dx), m(y0 * k + dy), m(x1 * k + dx), m(y1 * k + dy)] });
+          }
+        }
+      } catch { /* fall back to the preview picture */ }
+      const c = document.createElement("canvas"); c.width = vw; c.height = vh;
+      c.getContext("2d").drawImage(video, 0, 0);
       res({ img: c.getContext("2d").getImageData(0, 0, vw, vh), rect: [x0, y0, x1, y1] });
     };
   });

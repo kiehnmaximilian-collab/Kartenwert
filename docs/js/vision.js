@@ -288,6 +288,19 @@ export function crop(img, x0, y0, x1, y1) {
   return out;
 }
 
+// detectCard works on a shrunken picture; look again closer around the
+// card for exact corners.
+export function refine(img, q) {
+  const xs = q.map(p => p[0]), ys = q.map(p => p[1]);
+  const mx = (Math.max(...xs) - Math.min(...xs)) * 0.1, my = (Math.max(...ys) - Math.min(...ys)) * 0.1;
+  const x0 = Math.max(0, Math.min(...xs) - mx), y0 = Math.max(0, Math.min(...ys) - my);
+  const f = detectCard(crop(img, x0, y0, Math.max(...xs) + mx, Math.max(...ys) + my));
+  if (!f) return q;
+  const fine = f.map(([x, y]) => [x + x0, y + y0]);
+  const tol = 0.03 * Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+  return fine.every((p, i) => dist(p, q[i]) < tol) ? fine : q;
+}
+
 // The user placed the card inside a frame on screen. rect = [x0, y0, x1, y1]
 // of that frame in image pixels. Looks for the exact outline near the frame
 // and falls back to the frame itself if the result is implausible.
@@ -295,16 +308,25 @@ export function crop(img, x0, y0, x1, y1) {
 export function detectInFrame(img, rect) {
   const [x0, y0, x1, y1] = rect, fw = x1 - x0, fh = y1 - y0;
   const frameQuad = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
-  const px = fw * 0.15, py = fh * 0.15;
-  const cx0 = Math.max(0, x0 - px), cy0 = Math.max(0, y0 - py);
-  const part = crop(img, cx0, cy0, x1 + px, y1 + py);
-  const q = detectCard(part);
-  if (!q) return { quad: frameQuad, found: false };
-  const quad = q.map(([x, y]) => [x + cx0, y + cy0]);
   const area = p => Math.abs(p.reduce((s, a, i) => { const b = p[(i + 1) % 4]; return s + a[0] * b[1] - b[0] * a[1]; }, 0)) / 2;
-  const ratio = area(quad) / (fw * fh);
-  const h = (dist(quad[0], quad[3]) + dist(quad[1], quad[2])) / 2, w = (dist(quad[0], quad[1]) + dist(quad[3], quad[2])) / 2;
-  const shapeOk = Math.abs(h / w - CARD_RATIO) / CARD_RATIO < 0.18;
-  const near = quad.every((p, i) => dist(p, frameQuad[i]) < 0.25 * Math.hypot(fw, fh));
-  return ratio > 0.55 && ratio < 1.45 && shapeOk && near ? { quad, found: true } : { quad: frameQuad, found: false };
+  const centre = p => [p.reduce((s, a) => s + a[0], 0) / 4, p.reduce((s, a) => s + a[1], 0) / 4];
+  const plausible = (quad, minR, maxR) => {
+    if (!quad) return false;
+    const ratio = area(quad) / (fw * fh);
+    const h = (dist(quad[0], quad[3]) + dist(quad[1], quad[2])) / 2, w = (dist(quad[0], quad[1]) + dist(quad[3], quad[2])) / 2;
+    const shapeOk = Math.abs(h / w - CARD_RATIO) / CARD_RATIO < 0.18;
+    const near = dist(centre(quad), centre(frameQuad)) < 0.3 * Math.hypot(fw, fh);
+    return ratio > minR && ratio < maxR && shapeOk && near;
+  };
+  // 1. whole picture (works whenever there is background all around the card)
+  const all = detectCard(img);
+  if (plausible(all, 0.3, 2.6)) return { quad: refine(img, all), found: true };
+  // 2. close around the frame, but only if the outline lies inside the cut-out
+  const px = fw * 0.15, py = fh * 0.15;
+  const cx0 = Math.max(0, x0 - px), cy0 = Math.max(0, y0 - py), cx1 = Math.min(img.width, x1 + px), cy1 = Math.min(img.height, y1 + py);
+  const q = detectCard(crop(img, cx0, cy0, cx1, cy1));
+  const quad = q && q.map(([x, y]) => [x + cx0, y + cy0]);
+  const inside = quad && quad.every(([x, y]) => x > cx0 + 3 && y > cy0 + 3 && x < cx1 - 3 && y < cy1 - 3);
+  if (inside && plausible(quad, 0.55, 1.45)) return { quad, found: true };
+  return { quad: frameQuad, found: false };
 }
