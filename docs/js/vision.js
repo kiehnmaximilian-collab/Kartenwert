@@ -45,7 +45,7 @@ function fitLine(pts) {
 // (taken from the photo's outer frame), keep the biggest blob, fit a line to
 // each side and intersect them. Returns corners [tl, tr, br, bl] in image
 // coordinates, or null.
-export function detectCard(src) {
+function detectByColour(src) {
   const { img, scale } = downscale(src, 480);
   const { width: w, height: h, data: d } = img;
   const fr = Math.max(2, Math.round(Math.min(w, h) * 0.03));
@@ -112,6 +112,183 @@ export function detectCard(src) {
 }
 
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+// Gradients of a small grey-ish picture: per pixel the strongest Sobel
+// response over the three colour channels (a purple card edge on beige has
+// little brightness contrast but clear colour contrast).
+function gradients(img) {
+  const { width: w, height: h, data: d } = img;
+  const mag = new Float32Array(w * h), ang = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    let bm = 0, bx = 0, by = 0;
+    for (let c = 0; c < 3; c++) {
+      const v = (dx, dy) => d[((y + dy) * w + x + dx) * 4 + c];
+      const gx = v(1, -1) + 2 * v(1, 0) + v(1, 1) - v(-1, -1) - 2 * v(-1, 0) - v(-1, 1);
+      const gy = v(-1, 1) + 2 * v(0, 1) + v(1, 1) - v(-1, -1) - 2 * v(0, -1) - v(1, -1);
+      const m = gx * gx + gy * gy;
+      if (m > bm) { bm = m; bx = gx; by = gy; }
+    }
+    const p = y * w + x;
+    mag[p] = Math.sqrt(bm);
+    let a = Math.atan2(by, bx) * 180 / Math.PI;   // direction across the edge
+    if (a < 0) a += 180;
+    ang[p] = a;                                   // 0..180
+  }
+  return { w, h, mag, ang };
+}
+
+const angDiff = (a, b) => { const t = Math.abs(a - b) % 180; return Math.min(t, 180 - t); };
+
+// Straight lines via a Hough transform, one family at a time:
+// base 0 = steep lines (left/right sides), base 90 = flat lines (top/bottom).
+// A line is {t, r}: x*cos t + y*sin t = r (t in degrees).
+function houghLines(g, edge, base, maxTilt = 25, keep = 24) {
+  const { w, h, mag, ang } = g;
+  const nT = 2 * maxTilt + 1, R = Math.ceil(Math.hypot(w, h)), nR = 2 * R + 1;
+  const acc = new Float32Array(nT * nR);
+  const cs = [], sn = [];
+  for (let k = 0; k < nT; k++) { const t = (base + k - maxTilt) * Math.PI / 180; cs.push(Math.cos(t)); sn.push(Math.sin(t)); }
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const p = y * w + x;
+    if (mag[p] < edge) continue;
+    const a = ang[p];
+    for (let k = 0; k < nT; k++) {
+      if (angDiff(a, base + k - maxTilt) > 6) continue;
+      acc[k * nR + Math.round(x * cs[k] + y * sn[k]) + R] += 1;
+    }
+  }
+  const out = [];
+  const minVotes = 0.12 * (base ? w : h);
+  for (let n = 0; n < keep; n++) {
+    let bi = -1, bv = minVotes;
+    for (let i = 0; i < acc.length; i++) if (acc[i] > bv) { bv = acc[i]; bi = i; }
+    if (bi < 0) break;
+    const k = Math.floor(bi / nR), r = bi % nR - R;
+    out.push({ t: base + k - maxTilt, r });
+    for (let kk = Math.max(0, k - 2); kk <= Math.min(nT - 1, k + 2); kk++)
+      for (let rr = Math.max(0, r + R - 2); rr <= Math.min(nR - 1, r + R + 2); rr++) acc[kk * nR + rr] = 0;
+  }
+  return out;
+}
+
+function meetLines(a, b) {
+  const ta = a.t * Math.PI / 180, tb = b.t * Math.PI / 180;
+  const a1 = Math.cos(ta), b1 = Math.sin(ta), a2 = Math.cos(tb), b2 = Math.sin(tb);
+  const den = a1 * b2 - a2 * b1;
+  if (Math.abs(den) < 1e-6) return null;
+  return [(a.r * b2 - b.r * b1) / den, (a1 * b.r - a2 * a.r) / den];
+}
+
+// Share of points along a side (10..90 %) that sit on an edge running the
+// same way as the side.
+function coverage(g, edge, p, q) {
+  const { w, h, mag, ang } = g;
+  const dx = q[0] - p[0], dy = q[1] - p[1], len = Math.hypot(dx, dy);
+  if (len < 5) return 0;
+  const nx = -dy / len, ny = dx / len;
+  let dir = Math.atan2(ny, nx) * 180 / Math.PI; if (dir < 0) dir += 180;
+  const N = 40; let hit = 0;
+  for (let i = 0; i < N; i++) {
+    const f = 0.1 + 0.8 * i / (N - 1), x = p[0] + dx * f, y = p[1] + dy * f;
+    for (let o = -1; o <= 1; o++) {
+      const xi = Math.round(x + nx * o), yi = Math.round(y + ny * o);
+      if (xi < 1 || yi < 1 || xi >= w - 1 || yi >= h - 1) continue;
+      const k = yi * w + xi;
+      if (mag[k] >= edge && angDiff(ang[k], dir) < 20) { hit++; break; }
+    }
+  }
+  return hit / N;
+}
+
+// Average colour difference between thin strips on both sides of a side.
+// High for the card outline (card | table), low for a line running inside
+// the card's mottled border.
+function contrast(img, p, q) {
+  const { width: w, height: h, data: d } = img;
+  const dx = q[0] - p[0], dy = q[1] - p[1], len = Math.hypot(dx, dy);
+  const nx = -dy / len, ny = dx / len;
+  const at = (x, y, c) => d[(Math.min(h - 1, Math.max(0, Math.round(y))) * w + Math.min(w - 1, Math.max(0, Math.round(x)))) * 4 + c];
+  let sum = 0, n = 0;
+  for (let i = 0; i < 30; i++) {
+    const f = 0.1 + 0.8 * i / 29, x = p[0] + dx * f, y = p[1] + dy * f;
+    let diff = 0;
+    for (let c = 0; c < 3; c++) {
+      const a = at(x + nx * 2.5, y + ny * 2.5, c) + at(x + nx * 4, y + ny * 4, c);
+      const b = at(x - nx * 2.5, y - ny * 2.5, c) + at(x - nx * 4, y - ny * 4, c);
+      diff += ((a - b) / 2) ** 2;
+    }
+    sum += Math.sqrt(diff); n++;
+  }
+  return sum / n;
+}
+
+function edgeThreshold(g) {
+  const s = [];
+  for (let i = 0; i < g.mag.length; i += 3) s.push(g.mag[i]);
+  s.sort((a, b) => a - b);
+  return Math.min(120, Math.max(50, s[Math.floor(s.length * 0.7)]));
+}
+
+const quadArea = p => Math.abs(p.reduce((s, a, i) => { const b = p[(i + 1) % 4]; return s + a[0] * b[1] - b[0] * a[1]; }, 0)) / 2;
+
+// Find the card by its straight outline: the biggest card-shaped rectangle
+// whose four sides are all backed by edges. Copes with light, uneven
+// backgrounds and glare. Returns {quad, score} in the small picture's
+// coordinates scaled back, or null.
+function detectByEdges(src) {
+  const { img, scale } = downscale(src, 400);
+  const g = gradients(img), edge = edgeThreshold(g);
+  g.img = img;
+  const V = houghLines(g, edge, 0), H = houghLines(g, edge, 90);
+  const { w, h } = g;
+  const xAt = l => meetLines(l, { t: 90, r: h / 2 })[0];
+  const yAt = l => meetLines(l, { t: 0, r: w / 2 })[1];
+  V.sort((a, b) => xAt(a) - xAt(b)); H.sort((a, b) => yAt(a) - yAt(b));
+  let best = null;
+  for (let i = 0; i < V.length; i++) for (let j = i + 1; j < V.length; j++) {
+    if (xAt(V[j]) - xAt(V[i]) < 0.15 * w) continue;
+    for (let k = 0; k < H.length; k++) for (let m = k + 1; m < H.length; m++) {
+      if (yAt(H[m]) - yAt(H[k]) < 0.15 * h) continue;
+      const q = [meetLines(V[i], H[k]), meetLines(V[j], H[k]), meetLines(V[j], H[m]), meetLines(V[i], H[m])];
+      if (q.some(p => !p || p[0] < -0.05 * w || p[1] < -0.05 * h || p[0] > 1.05 * w || p[1] > 1.05 * h)) continue;
+      const sw = (dist(q[0], q[1]) + dist(q[3], q[2])) / 2, sh = (dist(q[0], q[3]) + dist(q[1], q[2])) / 2;
+      const ratio = Math.max(sw, sh) / Math.min(sw, sh);
+      if (Math.abs(ratio - CARD_RATIO) / CARD_RATIO > 0.15) continue;
+      const area = quadArea(q) / (w * h);
+      if (area < 0.08) continue;
+      const cov = [0, 1, 2, 3].map(s => coverage(g, edge, q[s], q[(s + 1) % 4]));
+      const minCov = Math.min(...cov);
+      if (minCov < 0.45) continue;
+      const mean = cov.reduce((a, b) => a + b) / 4;
+      const con = Math.min(...[0, 1, 2, 3].map(s => contrast(img, q[s], q[(s + 1) % 4])));
+      // well-backed sides first, then the outermost rectangle (the card,
+      // not the frame or the art box inside it)
+      const score = mean + Math.min(1, con / 60) + area;
+      if (!best || score > best.score) best = { q, score, mean };
+    }
+  }
+  if (!best) return null;
+  return { quad: portrait(best.q.map(([x, y]) => [x / scale, y / scale])), score: best.mean };
+}
+
+// How well a quad (full-size coordinates) is backed by edges, 0..1.
+function edgeSupport(src, quad) {
+  const { img, scale } = downscale(src, 400);
+  const g = gradients(img), edge = edgeThreshold(g);
+  const q = quad.map(([x, y]) => [x * scale, y * scale]);
+  return [0, 1, 2, 3].map(s => coverage(g, edge, q[s], q[(s + 1) % 4])).reduce((a, b) => a + b) / 4;
+}
+
+// Find the card: try the colour blob and the straight-edge search and keep
+// whichever outline is better backed by real edges in the photo.
+// Returns corners [tl, tr, br, bl] in image coordinates, or null.
+export function detectCard(src) {
+  const byEdge = detectByEdges(src);
+  const byColour = detectByColour(src);
+  if (!byEdge) return byColour;
+  if (!byColour) return byEdge.quad;
+  return edgeSupport(src, byColour) >= byEdge.score - 0.05 ? byColour : byEdge.quad;
+}
 
 // Card photographed sideways: rotate the corner order so the card is upright.
 export function portrait(q) {
@@ -294,11 +471,13 @@ export function refine(img, q) {
   const xs = q.map(p => p[0]), ys = q.map(p => p[1]);
   const mx = (Math.max(...xs) - Math.min(...xs)) * 0.1, my = (Math.max(...ys) - Math.min(...ys)) * 0.1;
   const x0 = Math.max(0, Math.min(...xs) - mx), y0 = Math.max(0, Math.min(...ys) - my);
-  const f = detectCard(crop(img, x0, y0, Math.max(...xs) + mx, Math.max(...ys) + my));
+  const part = crop(img, x0, y0, Math.max(...xs) + mx, Math.max(...ys) + my);
+  const e = detectByEdges(part);
+  const f = e && e.score > 0.6 ? e.quad : null;
   if (!f) return q;
   const fine = f.map(([x, y]) => [x + x0, y + y0]);
   const tol = 0.03 * Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
-  return fine.every((p, i) => dist(p, q[i]) < tol) ? fine : q;
+  return fine.every((p, i) => dist(p, q[i]) < tol) && edgeSupport(img, fine) >= edgeSupport(img, q) ? fine : q;
 }
 
 // The user placed the card inside a frame on screen. rect = [x0, y0, x1, y1]
