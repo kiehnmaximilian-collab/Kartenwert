@@ -77,7 +77,9 @@ function capture(side, job) {
     <div class="box" id="pick">
       <h2>${side === "front" ? "1" : "2"}. ${name} fotografieren</h2>
       <p class="sub">${side === "back" ? "Die Rückseite ist wichtig: Weiße Stellen an den braunen Kanten zeigen, wie viel die Karte gespielt wurde." : "Lege die Karte so in den Rahmen, dass der Set-Code unter dem Bild scharf ist."}</p>
-      <button class="wide" id="cam">Kamera mit Rahmen öffnen</button>
+      <label class="btn wide"><input type="file" accept="image/*" capture="environment" hidden id="file">Foto mit der Kamera-App</label>
+      <p class="sub">Die Kamera-App deines Handys stellt am besten scharf. Danach markierst du die Karte im Foto.</p>
+      <button class="sec wide" id="cam">Kamera mit Rahmen</button>
       <label class="btn sec wide"><input type="file" accept="image/*" hidden id="file2">Foto aus der Galerie</label>
     </div>
     <div class="box" id="adjust" hidden>
@@ -90,7 +92,7 @@ function capture(side, job) {
     app.querySelector("#pick").hidden = true;
     app.querySelector("#adjust").hidden = false;
     app.querySelector("#detmsg").innerHTML = (sharp < SHARP_MIN
-      ? `<b class="warn">Das Foto ist unscharf.</b> Tippe besser auf „Neu aufnehmen“: Handy etwas weiter weg, vor dem Auslösen auf die Karte tippen, mehr Licht.<br>` : "") + (found
+      ? `<b class="warn">Das Foto ist unscharf.</b> Tippe besser auf „Neu aufnehmen“: Handy etwas weiter weg (ca. 20 cm), vor dem Auslösen auf die Karte tippen, mehr Licht.<br>` : "") + (found
       ? "Karte erkannt. Liegt ein blauer Punkt nicht genau auf einer Kartenecke, zieh ihn mit dem Finger hin."
       : `<span class="warn">Den Kartenrand konnte ich nicht sicher finden.</span> Zieh die vier blauen Punkte genau auf die Kartenecken.`);
     editor(img, quad, q => { job[side] = { img, quad: q }; side === "front" ? capture("back", job) : analyze(job); });
@@ -107,16 +109,27 @@ function capture(side, job) {
   }).catch(e => {
     app.querySelector("#pick").insertAdjacentHTML("beforeend", `<p class="err">Kamera nicht verfügbar (${esc(e.message || e)}). Erlaube den Kamerazugriff oder nimm ein Foto aus der Galerie.</p>`);
   });
-  app.querySelector("#file2").onchange = async e => {
+  const fromFile = async e => {
     const f = e.target.files[0];
     if (!f) return;
-    const img = await fileToImage(f);
+    app.querySelector("#pick").insertAdjacentHTML("beforeend", `<p class="progress" id="busy"><span class="spinner"></span>Suche die Karte im Foto…</p>`);
+    await new Promise(r => setTimeout(r, 30));
+    const img = await fileToImage(f, 3000);
     let quad = detectCard(img);
     if (quad) quad = refine(img, quad);
     const found = !!quad;
-    if (!quad) { const w = img.width, h = img.height; quad = [[w * .25, h * .2], [w * .75, h * .2], [w * .75, h * .8], [w * .25, h * .8]]; }
-    next(img, quad, found);
+    if (!quad) {
+      // card-shaped outline in the middle; usually only small drags needed
+      const w = img.width, h = img.height;
+      let ch = h * 0.6, cw = ch * 59 / 86;
+      if (cw > w * 0.8) { cw = w * 0.8; ch = cw * 86 / 59; }
+      const x0 = (w - cw) / 2, y0 = (h - ch) / 2;
+      quad = [[x0, y0], [x0 + cw, y0], [x0 + cw, y0 + ch], [x0, y0 + ch]];
+    }
+    next(img, quad, found, found ? sharpness(warp(img, quad, 500)) : Infinity);
   };
+  app.querySelector("#file").onchange = fromFile;
+  app.querySelector("#file2").onchange = fromFile;
 }
 
 // Full-screen live camera with a card-shaped frame. Resolves {img, rect}
