@@ -92,7 +92,7 @@ export function cardmarketLinks(card) {
 }
 
 // Digits the text recognition likes to confuse.
-const LOOKALIKE = { 0: "689", 6: "058", 8: "0369", 9: "08", 5: "63", 3: "85", 1: "7", 7: "1", 2: "7" };
+const LOOKALIKE = { 0: "689", 6: "058", 8: "0369", 9: "08", 5: "836", 3: "85", 1: "7", 7: "1", 2: "7" };
 
 // Like lookup(), but if the code is unknown, also tries codes with one
 // commonly misread digit changed. Returns {info, code} or null.
@@ -111,4 +111,70 @@ export async function lookupFuzzy(code, get = fetch, maxTries = 14) {
     }
   }
   return null;
+}
+
+// ---- Passcode (8 digits bottom left) ----
+
+export function parsePasscode(text) {
+  const m = (text || "").replace(/[^0-9]/g, " ").match(/\b\d{8}\b/);
+  return m ? m[0] : "";
+}
+
+// {name, image, sets:[{code, setName, rarity}]} or null
+export async function lookupById(id, get = fetch) {
+  const r = await get(API + "cardinfo.php?id=" + encodeURIComponent(id));
+  if (!r.ok) return null;
+  const card = ((await r.json()).data || [])[0];
+  if (!card) return null;
+  return {
+    name: card.name, image: (card.card_images || [])[0]?.image_url_small || "",
+    sets: (card.card_sets || []).map(s => ({ code: (s.set_code || "").toUpperCase(), setName: s.set_name || "", rarity: s.set_rarity || "" })),
+  };
+}
+
+// Set code in the card's language: "SD6-EN008" + "DE" -> "SD6-DE008"
+export function localCode(enCode, region) {
+  const m = (enCode || "").match(/^([A-Z0-9]+)-([A-Z]{0,2})(\d+)$/);
+  return m ? `${m[1]}-${region}${m[3]}` : enCode;
+}
+
+// Characters the text recognition mixes up cost less to swap.
+const SIMILAR = ["0ODQUC", "1IL7T", "2Z", "5S", "8B3S", "6G", "9G"];
+const subCost = (x, y) => x === y ? 0 : SIMILAR.some(g => g.includes(x) && g.includes(y)) ? 0.3 : 1;
+
+function lev(a, b) {
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + subCost(a[i - 1], b[j - 1]));
+  return d[a.length][b.length];
+}
+
+const REGIONS = ["DE", "G", "EN", "E", "FR", "F", "IT", "I", "SP", "S", "PT", "P", ""];
+
+// Which of the card's printings matches the (possibly garbled) set-code
+// texts best? texts: raw OCR strings like "SD6-DEOOS" or "SD6DEUUS".
+// Returns {set, code, region, dist} or null when nothing is clearly closest.
+export function bestPrinting(sets, texts) {
+  const ts = texts.map(t => (t || "").toUpperCase().replace(/[^A-Z0-9]/g, "")).filter(t => t.length >= 5);
+  const scored = [];
+  for (const s of sets) {
+    const e = s.code.match(/^([A-Z0-9]+)-[A-Z]{0,2}(\d+)$/);
+    if (!e) continue;
+    let best = null;
+    for (const region of REGIONS) {
+      const cand = e[1] + region + e[2];
+      for (const t of ts) {
+        const dist = lev(t, cand);
+        if (!best || dist < best.dist) best = { set: s, region, code: `${e[1]}-${region}${e[2]}`, dist };
+      }
+    }
+    if (best) scored.push(best);
+  }
+  scored.sort((a, b) => a.dist - b.dist);
+  const top = scored[0];
+  if (!top || top.dist > 2.5) return null;
+  const rival = scored.find(x => x.set.code !== top.set.code);
+  if (rival && rival.dist - top.dist < 0.5) return null;
+  return top;
 }

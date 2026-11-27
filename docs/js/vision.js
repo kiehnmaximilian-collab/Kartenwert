@@ -392,6 +392,15 @@ export function whitening(back, margin = MARGIN) {
   }
   const refL = median(ref);
   const minL = Math.max(135, refL + 70);
+  // table colour from the outermost strip of the margin: a light table just
+  // outside the detected outline must not count as worn, white card edge
+  const bgR = [], bgG = [], bgB = [];
+  for (let y = 0; y < Hh; y += 2) for (let x = 0; x < W; x += 2) {
+    const cx = x - mx, cy = y - my;
+    if (Math.min(cx, cw - cx, cy, ch - cy) > -0.6 * margin * cw) continue;
+    const i = (y * W + x) * 4; bgR.push(d[i]); bgG.push(d[i + 1]); bgB.push(d[i + 2]);
+  }
+  const bg = bgR.length ? [median(bgR), median(bgG), median(bgB)] : null;
   const zones = { oben: 0, unten: 0, links: 0, rechts: 0, ol: 0, or: 0, ul: 0, ur: 0 };
   const totals = { ...zones };
   const spots = [];
@@ -410,7 +419,8 @@ export function whitening(back, margin = MARGIN) {
     const i = (y * W + x) * 4;
     const r = d[i], g = d[i + 1], b = d[i + 2];
     const L = lum(d, i), sat = Math.max(r, g, b) - Math.min(r, g, b);
-    if (L >= minL && sat < 70) { zones[zone]++; spots.push(x, y); }
+    const likeTable = bg && Math.hypot(r - bg[0], g - bg[1], b - bg[2]) < 45;
+    if (L >= minL && sat < 70 && !likeTable) { zones[zone]++; spots.push(x, y); }
   }
   const frac = {};
   for (const k in zones) frac[k] = totals[k] ? zones[k] / totals[k] : 0;
@@ -444,7 +454,28 @@ export function centering(front, margin = MARGIN) {
 }
 
 // Grayscale, contrast-stretched, upscaled crop for the text recognition.
-export function forOcr(img, scale = 3) {
+// Cut a text region (card coordinates u0..u1, v0..v1) straight out of the
+// ORIGINAL photo at high resolution, as if the card were cardPx wide.
+export function warpRegion(src, quad, u0, v0, u1, v1, cardPx = 2400) {
+  const [a, b, c, d, e, f, g, h] = squareToQuad(quad);
+  const W = Math.max(8, Math.round((u1 - u0) * cardPx)), H = Math.max(8, Math.round((v1 - v0) * cardPx * CARD_RATIO));
+  const out = makeImage(W, H), sw = src.width, sh = src.height, s = src.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const u = u0 + (x + 0.5) / W * (u1 - u0), v = v0 + (y + 0.5) / H * (v1 - v0);
+    const den = g * u + h * v + 1;
+    const px = Math.min(sw - 1.001, Math.max(0, (a * u + b * v + c) / den - 0.5));
+    const py = Math.min(sh - 1.001, Math.max(0, (d * u + e * v + f) / den - 0.5));
+    const x0 = px | 0, y0 = py | 0, fx = px - x0, fy = py - y0, o = (y * W + x) * 4;
+    const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4;
+    for (let k = 0; k < 3; k++)
+      out.data[o + k] = (s[i00 + k] * (1 - fx) + s[i10 + k] * fx) * (1 - fy) + (s[i01 + k] * (1 - fx) + s[i11 + k] * fx) * fy;
+    out.data[o + 3] = 255;
+  }
+  return out;
+}
+
+// Simple variant: grey, contrast stretched, enlarged (no thresholding).
+export function stretchGray(img, scale = 3) {
   const w = img.width * scale, h = img.height * scale, out = makeImage(w, h);
   let lo = 255, hi = 0;
   for (let i = 0; i < img.data.length; i += 4) { const l = lum(img.data, i); lo = Math.min(lo, l); hi = Math.max(hi, l); }
@@ -456,6 +487,111 @@ export function forOcr(img, scale = 3) {
   }
   return out;
 }
+
+// Black text on white for the text recognition. Uses the brightest colour
+// channel (black print is dark in all of them, the orange / green / purple
+// card background is bright in at least one), a light blur against JPEG
+// noise, then Otsu's threshold. Adds a white border.
+export function forOcr(img, textH = 48, inkBias = 0.15) {
+  const { width: w, height: h, data: d } = img;
+  const v = new Float32Array(w * h);
+  for (let p = 0; p < w * h; p++) v[p] = Math.max(d[p * 4], d[p * 4 + 1], d[p * 4 + 2]);
+  const bl = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let sum = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx >= 0 && yy >= 0 && xx < w && yy < h) { sum += v[yy * w + xx]; n++; }
+    }
+    bl[y * w + x] = sum / n;
+  }
+  const hist = new Float64Array(256);
+  for (const x of bl) hist[Math.min(255, x | 0)]++;
+  let total = w * h, sumAll = 0; for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+  let wB = 0, sumB = 0, best = 0, thr = 128, mDark = 0, mLight = 255;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sumAll - sumB) / wF, between = wB * wF * (mB - mF) ** 2;
+    if (between > best) { best = between; thr = t; mDark = mB; mLight = mF; }
+  }
+  // lean towards ink: thin print breaks apart at the plain Otsu threshold
+  thr += inkBias * (mLight - mDark);
+  const ink = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) ink[p] = bl[p] > thr ? 0 : 1;
+  const keep = textOnly(ink, w, h, textH);
+  if (!keep) return null;
+  const [kx0, ky0, kx1, ky1, mask] = keep;
+  const cw = kx1 - kx0 + 1, chh = ky1 - ky0 + 1, pad = Math.round(chh * 0.6);
+  const W = cw + 2 * pad, H = chh + 2 * pad, out = makeImage(W, H);
+  out.data.fill(255);
+  for (let y = ky0; y <= ky1; y++) for (let x = kx0; x <= kx1; x++) {
+    if (!mask[y * w + x]) continue;
+    const o = ((y - ky0 + pad) * W + x - kx0 + pad) * 4;
+    out.data[o] = out.data[o + 1] = out.data[o + 2] = 0;
+  }
+  return out;
+}
+
+// Keep only the line of text: erase long straight runs (the frame lines
+// above and below the set code, which often touch the letters), find the
+// largest row of letter-sized blobs, and keep everything on that row
+// (including the small "-"). Returns [x0, y0, x1, y1, mask] or null.
+function textOnly(src, w, h, textH) {
+  const ink = Uint8Array.from(src), long = 1.5 * textH;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w;) {
+    if (!src[y * w + x]) { x++; continue; }
+    let e = x; while (e < w && src[y * w + e]) e++;
+    if (e - x > long) ink.fill(0, y * w + x, y * w + e);
+    x = e;
+  }
+  for (let x = 0; x < w; x++) for (let y = 0; y < h;) {
+    if (!src[y * w + x]) { y++; continue; }
+    let e = y; while (e < h && src[e * w + x]) e++;
+    if (e - y > long) for (let k = y; k < e; k++) ink[k * w + x] = 0;
+    y = e;
+  }
+  const label = new Int32Array(w * h).fill(-1), stack = new Int32Array(w * h), comps = [];
+  for (let p = 0; p < w * h; p++) {
+    if (!ink[p] || label[p] >= 0) continue;
+    const c = { x0: w, y0: h, x1: 0, y1: 0, px: [] };
+    let sp = 0; stack[sp++] = p; label[p] = comps.length;
+    while (sp) {
+      const q = stack[--sp], x = q % w, y = (q / w) | 0;
+      c.px.push(q);
+      if (x < c.x0) c.x0 = x; if (x > c.x1) c.x1 = x; if (y < c.y0) c.y0 = y; if (y > c.y1) c.y1 = y;
+      if (x > 0 && ink[q - 1] && label[q - 1] < 0) { label[q - 1] = 0; stack[sp++] = q - 1; }
+      if (x < w - 1 && ink[q + 1] && label[q + 1] < 0) { label[q + 1] = 0; stack[sp++] = q + 1; }
+      if (y > 0 && ink[q - w] && label[q - w] < 0) { label[q - w] = 0; stack[sp++] = q - w; }
+      if (y < h - 1 && ink[q + w] && label[q + w] < 0) { label[q + w] = 0; stack[sp++] = q + w; }
+    }
+    c.w = c.x1 - c.x0 + 1; c.h = c.y1 - c.y0 + 1; c.cy = (c.y0 + c.y1) / 2;
+    c.edge = c.x0 === 0 || c.y0 === 0 || c.x1 === w - 1 || c.y1 === h - 1;
+    comps.push(c);
+  }
+  const letters = comps.filter(c => !c.edge && c.h >= 0.5 * textH && c.h <= 1.8 * textH &&
+    c.w <= 2 * textH && c.px.length >= 0.1 * c.w * c.h);
+  if (letters.length < 2) return null;
+  let group = [];
+  for (const s of letters) {
+    const g = letters.filter(c => Math.abs(c.cy - s.cy) < 0.35 * textH);
+    if (g.length > group.length) group = g;
+  }
+  const med = a => a.sort((x, y) => x - y)[a.length >> 1];
+  const top = med(group.map(c => c.y0)), bot = med(group.map(c => c.y1)), lh = bot - top;
+  const gx0 = Math.min(...group.map(c => c.x0)) - 2 * textH, gx1 = Math.max(...group.map(c => c.x1)) + 2 * textH;
+  const keep = comps.filter(c => group.includes(c) || (!c.edge && c.h <= 1.8 * textH && c.px.length >= 0.03 * textH * textH &&
+    c.cy > top + 0.2 * lh && c.cy < bot - 0.2 * lh && c.x1 > gx0 && c.x0 < gx1));
+  const mask = new Uint8Array(w * h);
+  let x0 = w, y0 = h, x1 = 0, y1 = 0;
+  for (const c of keep) {
+    for (const q of c.px) mask[q] = 1;
+    x0 = Math.min(x0, c.x0); y0 = Math.min(y0, c.y0); x1 = Math.max(x1, c.x1); y1 = Math.max(y1, c.y1);
+  }
+  return [x0, y0, x1, y1, mask];
+}
+
 
 export function crop(img, x0, y0, x1, y1) {
   x0 = Math.max(0, Math.round(x0)); y0 = Math.max(0, Math.round(y0));

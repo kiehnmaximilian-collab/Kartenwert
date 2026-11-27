@@ -64,3 +64,16 @@ test("misread digit is corrected through the database", async () => {
   assert.equal(r.info.name, "Nobleman of Crossout");
   assert.equal(await lookupFuzzy("XXX-DE111", get), null);
 });
+
+import { parsePasscode, bestPrinting, localCode } from "../docs/js/cards.js";
+
+test("passcode and printing from garbled set-code texts", () => {
+  assert.equal(parsePasscode("72630549\n"), "72630549");
+  assert.equal(parsePasscode("7263054"), "");
+  const sets = [{ code: "SD6-EN008" }, { code: "DB2-EN092" }, { code: "DR1-EN204" }, { code: "SD6-EN018" }];
+  // real OCR output from a photo of SD6-DE008
+  const hit = bestPrinting(sets, ["SDDEOCOS\n", "SD6-DEUUS\n", "SD6DEOOS\n", "SD6-DEVUS\n"]);
+  assert.equal(hit.code, "SD6-DE008");
+  assert.equal(bestPrinting(sets, ["nothing"]), null);
+  assert.equal(localCode("SD6-EN008", "DE"), "SD6-DE008");
+});

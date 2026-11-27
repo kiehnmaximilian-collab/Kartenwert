@@ -1,5 +1,5 @@
-import { detectCard, detectInFrame, refine, crop, warp, rotate180, cropCard, whitening, centering, sharpness, forOcr, makeImage } from "./vision.js";
-import { parseSetCode, languageOf, lookupFuzzy, cardmarketLinks } from "./cards.js";
+import { detectCard, detectInFrame, refine, crop, warp, rotate180, whitening, centering, sharpness, forOcr, warpRegion, stretchGray, cropCard, makeImage } from "./vision.js";
+import { parseSetCode, languageOf, lookupFuzzy, cardmarketLinks, parsePasscode, lookupById, bestPrinting, localCode } from "./cards.js";
 import { grade, QUESTIONS } from "./grade.js";
 import * as db from "./store.js";
 
@@ -265,19 +265,49 @@ async function ocrWorker() {
   return worker;
 }
 
-async function readCode(front) {
+// Reads the set code (right under the artwork) and the 8-digit passcode
+// (bottom left) straight from the original photo in high resolution.
+// Tries the card upside down too.
+async function readCode(src, quad) {
   const w = await ocrWorker();
-  const regions = [[0.55, 0.712, 0.96, 0.772], [0.04, 0.69, 0.96, 0.80]];
-  for (const img of [front, rotate180(front)]) {
-    for (const [u0, v0, u1, v1] of regions) {
-      const crop = forOcr(cropCard(img, u0, v0, u1, v1));
-      await w.setParameters({ tessedit_pageseg_mode: u1 - u0 > 0.6 ? "6" : "7" });
-      const { data } = await w.recognize(toCanvas(crop));
-      const code = parseSetCode(data.text);
-      if (code) return { code, flipped: img !== front, raw: data.text };
+  const out = { code: "", flipped: false, passcode: "", texts: [] };
+  const run = async (q, region, bias) => {
+    let img;
+    if (bias === null) {      // the plain way: small straightened card, enlarged grey crop
+      const [u0, v0, u1, v1] = region;
+      img = stretchGray(cropCard(warp(src, q, WARP_W), u0, v0, u1, v1));
+    } else img = forOcr(warpRegion(src, q, ...region), 48, bias);
+    return img ? (await w.recognize(toCanvas(img))).data.text : "";
+  };
+  for (const [q, flipped] of [[quad, false], [[quad[2], quad[3], quad[0], quad[1]], true]]) {
+    await w.setParameters({ tessedit_char_whitelist: "0123456789", tessedit_pageseg_mode: "7" });
+    for (const bias of [0.3, 0.15, 0.45]) {
+      const pc = parsePasscode(await run(q, [0.02, 0.95, 0.4, 1.0], bias));
+      if (pc) { out.passcode = pc; break; }
     }
+    await w.setParameters({ tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", tessedit_pageseg_mode: "7" });
+    for (const [region, biases] of [[[0.5, 0.69, 0.97, 0.79], [0, 0.15]], [[0.55, 0.705, 0.97, 0.755], [0, 0.15]], [[0.55, 0.712, 0.96, 0.772], [null]]]) {
+      for (const bias of biases) {
+        const text = await run(q, region, bias);
+        out.texts.push(text);
+      }
+    }
+    // the code read most often wins
+    const votes = {};
+    for (const t of out.texts) { const c = parseSetCode(t); if (c) votes[c] = (votes[c] || 0) + 1; }
+    out.codes = Object.keys(votes).sort((a, b) => votes[b] - votes[a]);
+    out.code = out.codes[0] || "";
+    if (out.passcode || out.code) {
+      out.flipped = flipped;
+      // "1. Auflage" / "1st Edition" left under the artwork
+      await w.setParameters({ tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789. " });
+      const ed = await run(q, [0.03, 0.69, 0.5, 0.79], 0.15).catch(() => "");
+      out.firstEd = /auf|lage|edit|1st/i.test(ed);
+      return out;
+    }
+    out.texts = [];
   }
-  return { code: "", flipped: false, raw: "" };
+  return out;
 }
 
 async function analyze(job) {
@@ -293,19 +323,46 @@ async function analyze(job) {
   if (wh.brightBorder) warnings.push("Der Rand der Rückseite wirkt sehr hell. War es wirklich die Rückseite, oder spiegelt das Licht?");
   if (sharpness(back) < 25) warnings.push("Das Foto der Rückseite ist etwas unscharf. Weiße Stellen werden dann schlechter erkannt.");
   await step("Lese den Set-Code (beim ersten Mal lädt die Texterkennung kurz)…");
-  let ocr = { code: "", flipped: false };
-  try { ocr = await readCode(front); } catch (e) { warnings.push("Texterkennung nicht verfügbar: " + e.message); }
+  let ocr = { code: "", flipped: false, passcode: "", texts: [] };
+  try { ocr = await readCode(job.front.img, job.front.quad); } catch (e) { warnings.push("Texterkennung nicht verfügbar: " + e.message); }
   if (ocr.flipped) front = rotate180(front);
   const cen = centering(front);
-  const card = { setCode: ocr.code, language: languageOf(ocr.code) || "DE", firstEd: false, name: "", setName: "", rarity: "", rarities: [] };
-  if (ocr.code) {
+  const card = { setCode: ocr.code, language: languageOf(ocr.code) || "DE", firstEd: !!ocr.firstEd, name: "", setName: "", rarity: "", rarities: [], options: [] };
+  let done = false;
+  if (ocr.passcode) {
     await step("Suche die Karte in der Kartendatenbank…");
-    const hit = await lookupFuzzy(ocr.code).catch(() => null);
+    const info = await lookupById(ocr.passcode).catch(() => null);
+    if (info) {
+      Object.assign(card, { name: info.name, image: info.image });
+      const bp = bestPrinting(info.sets, ocr.texts);
+      const codes = [...new Set(info.sets.map(s => s.code))];
+      const region = bp && bp.region ? bp.region : "DE";
+      card.options = codes.map(c => localCode(c, region));
+      const set = bp ? bp.set : codes.length === 1 ? info.sets[0] : null;
+      if (set) {
+        Object.assign(card, { setCode: localCode(set.code, region), setName: set.setName,
+          rarities: [...new Set(info.sets.filter(s => s.code === set.code).map(s => s.rarity))] });
+        card.rarity = card.rarities[0] || "";
+        card.language = languageOf(card.setCode) || "DE";
+        done = true;
+      } else {
+        card.setCode = "";
+        warnings.push(`Karte erkannt: ${info.name}. Den Set-Code konnte ich nicht sicher lesen. Bitte wähle ihn unten aus (er steht rechts unter dem Bild).`);
+        done = true;
+      }
+    }
+  }
+  if (!done && ocr.code) {
+    await step("Suche die Karte in der Kartendatenbank…");
+    let hit = null;
+    for (const c of (ocr.codes || [ocr.code]).slice(0, 3)) {
+      hit = await lookupFuzzy(c).catch(() => null);
+      if (hit) { if (hit.code !== c || (ocr.codes || []).length > 1) warnings.push(`Gelesen wurde ${c}, gemeint ist wohl ${hit.code}. Bitte kurz auf der Karte prüfen.`); break; }
+    }
     const info = hit && hit.info;
-    if (hit && hit.code !== ocr.code) warnings.push(`Gelesen wurde ${ocr.code}, gemeint ist wohl ${hit.code}. Bitte kurz auf der Karte prüfen.`);
     if (info) Object.assign(card, { setCode: hit.code, name: info.name, setName: info.setName, rarities: info.rarities, rarity: info.rarities[0] || "", image: info.image });
     else warnings.push("Die Kartendatenbank war nicht erreichbar oder kennt den Code nicht. Trag Name und Set unten selbst ein.");
-  } else warnings.push("Den Set-Code konnte ich nicht lesen. Bitte unten eintragen, er steht rechts unter dem Bild.");
+  } else if (!done) warnings.push("Den Set-Code konnte ich nicht lesen. Bitte unten eintragen, er steht rechts unter dem Bild.");
   result({ front, back, whitening: wh, centering: cen, card, answers: {}, warnings, time: Date.now() });
 }
 
@@ -336,7 +393,7 @@ function result(r) {
     <div class="box">
       <h2>Karte</h2>
       <form id="card">
-        <div class="row"><div><label class="f">Set-Code</label><input type="text" name="setCode" value="${esc(c.setCode)}" autocapitalize="characters" placeholder="z.B. PSV-DE092"></div>
+        <div class="row"><div><label class="f">Set-Code</label><input type="text" name="setCode" value="${esc(c.setCode)}" autocapitalize="characters" placeholder="z.B. PSV-DE092" list="codes"><datalist id="codes">${(c.options || []).map(o => `<option value="${esc(o)}">`).join("")}</datalist></div>
           <div style="flex:0 0 auto"><button type="button" class="sec small" id="look">Suchen</button></div></div>
         <label class="f">Name (englisch, wie auf Cardmarket)</label><input type="text" name="name" value="${esc(c.name)}">
         <label class="f">Set</label><input type="text" name="setName" value="${esc(c.setName)}">
